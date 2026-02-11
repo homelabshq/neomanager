@@ -82,7 +82,7 @@ download_release() {
 
     while IFS= read -r filename; do
         local url="${base_url}/${filename}"
-        log "Trying $url..."
+        log "Trying $url..." >&2
         if curl -fL -o "$dest_dir/$filename" "$url" 2>/dev/null; then
             echo "$dest_dir/$filename"
             return 0
