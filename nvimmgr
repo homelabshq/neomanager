@@ -1,0 +1,563 @@
+#!/usr/bin/env bash
+
+set -e
+
+NEOMANAGER_VERSION="0.1.0"
+NEOMANAGER_DIR="${NEOMANAGER_DIR:-$HOME/.neomanager}"
+VERSIONS_DIR="$NEOMANAGER_DIR/versions"
+CURRENT_FILE="$NEOMANAGER_DIR/current"
+NEOVIM_REPO="https://github.com/neovim/neovim"
+RELEASES_API="https://api.github.com/repos/neovim/neovim/releases"
+
+detect_platform() {
+    local kernel
+    local machine
+
+    kernel="$(uname -s)"
+    machine="$(uname -m)"
+
+    case "$kernel" in
+        Linux)
+            case "$machine" in
+                i686|i386) echo "linux32" ;;
+                x86_64) echo "linux64" ;;
+                aarch64|arm64) echo "linux64-arm64" ;;
+                armv6l|armv7l) echo "linux-armv7l" ;;
+                *) echo "unknown" ;;
+            esac
+            ;;
+        Darwin)
+            case "$machine" in
+                x86_64) echo "macos-x86_64" ;;
+                arm64) echo "macos-arm64" ;;
+                *) echo "unknown" ;;
+            esac
+            ;;
+        *)
+            echo "unknown"
+            ;;
+    esac
+}
+
+PLATFORM=$(detect_platform)
+
+init_dirs() {
+    mkdir -p "$VERSIONS_DIR"
+}
+
+show_help() {
+    cat << 'EOF'
+neomanager - A version manager for neovim
+
+USAGE:
+    neomanager <COMMAND> [OPTIONS]
+
+COMMANDS:
+    install <version>      Install a specific neovim version (e.g. v0.10.0, nightly)
+    install-latest         Install the latest stable neovim release
+    install-source         Build and install neovim from source
+    uninstall <version>    Uninstall a specific version
+    list                   List all installed versions
+    list-remote            List available versions from GitHub releases
+    use <version>          Set default neovim version globally
+    use-local <version>    Set neovim version for current directory (.nvimrc)
+    current                Show currently active version
+    which                  Show path to active neovim binary
+    update                 Check for available updates
+    version                Show neomanager version
+    help                   Show this help message
+
+EXAMPLES:
+    neomanager install v0.10.0
+    neomanager install nightly
+    neomanager install-latest
+    neomanager install-source
+    neomanager use v0.10.0
+    neomanager use-local v0.9.5
+    neomanager list-remote | head -20
+
+For more information, visit: https://github.com/homelabshq/neomanager
+EOF
+}
+
+log() {
+    echo "neomanager: $1"
+}
+
+error() {
+    echo "neomanager error: $1" >&2
+    exit 1
+}
+
+warn() {
+    echo "neomanager warning: $1" >&2
+}
+
+# Verify that required commands are available
+require_cmd() {
+    if ! command -v "$1" &> /dev/null; then
+        error "'$1' is required but not found. Please install it first."
+    fi
+}
+
+list_installed() {
+    init_dirs
+    local versions
+    versions=$(ls -1 "$VERSIONS_DIR" 2>/dev/null)
+    if [ -z "$versions" ]; then
+        log "No versions installed"
+    else
+        local current
+        current=$(cat "$CURRENT_FILE" 2>/dev/null || echo "")
+        echo "$versions" | sort -V | while read -r v; do
+            if [ "$v" = "$current" ]; then
+                echo "* $v (active)"
+            else
+                echo "  $v"
+            fi
+        done
+    fi
+}
+
+list_remote() {
+    require_cmd curl
+    log "Fetching available versions from GitHub..."
+    local page=1
+    local results=""
+    while true; do
+        local page_data
+        page_data=$(curl -s "${RELEASES_API}?per_page=100&page=${page}")
+        local tags
+        tags=$(echo "$page_data" | grep -o '"tag_name": "v[0-9.]*"' | cut -d'"' -f4)
+        if [ -z "$tags" ]; then
+            break
+        fi
+        results="${results}${tags}"$'\n'
+        page=$((page + 1))
+        # Safety limit to avoid infinite loops
+        if [ "$page" -gt 10 ]; then
+            break
+        fi
+    done
+    echo "$results" | grep -v '^$' | sort -V -r
+}
+
+install_version() {
+    local version="$1"
+
+    if [ -z "$version" ]; then
+        error "Please specify a version. Usage: neomanager install <version>"
+    fi
+
+    require_cmd curl
+    require_cmd tar
+    init_dirs
+
+    if [ "$version" = "nightly" ]; then
+        install_nightly
+        return
+    fi
+
+    local version_dir="$VERSIONS_DIR/$version"
+
+    if [ -d "$version_dir" ]; then
+        log "Version $version is already installed"
+        return
+    fi
+
+    if [ "$PLATFORM" = "unknown" ]; then
+        error "Unsupported platform: $(uname -s) $(uname -m)"
+    fi
+
+    log "Installing neovim $version..."
+
+    local filename="nvim-${PLATFORM}.tar.gz"
+    local download_url="https://github.com/neovim/neovim/releases/download/${version}/${filename}"
+
+    local temp_dir
+    temp_dir=$(mktemp -d)
+
+    log "Downloading from $download_url..."
+    if ! curl -fL -o "$temp_dir/$filename" "$download_url"; then
+        rm -rf "$temp_dir"
+        error "Failed to download neovim $version. Verify the version exists: neomanager list-remote"
+    fi
+
+    log "Extracting..."
+    mkdir -p "$version_dir"
+    if ! tar -xzf "$temp_dir/$filename" -C "$version_dir" --strip-components=1; then
+        rm -rf "$temp_dir" "$version_dir"
+        error "Failed to extract archive"
+    fi
+
+    rm -rf "$temp_dir"
+
+    # Verify the binary exists
+    if [ ! -x "$version_dir/bin/nvim" ]; then
+        rm -rf "$version_dir"
+        error "Installation failed: nvim binary not found in extracted archive"
+    fi
+
+    log "Successfully installed neovim $version"
+
+    if [ ! -f "$CURRENT_FILE" ]; then
+        echo "$version" > "$CURRENT_FILE"
+        log "Set $version as default version"
+    fi
+}
+
+install_latest() {
+    require_cmd curl
+    log "Finding latest stable version..."
+    local latest
+    latest=$(curl -s "${RELEASES_API}?per_page=1" | grep -o '"tag_name": "v[0-9.]*"' | head -n1 | cut -d'"' -f4)
+
+    if [ -z "$latest" ]; then
+        error "Failed to fetch latest version. Check your internet connection."
+    fi
+
+    log "Latest version is $latest"
+    install_version "$latest"
+}
+
+install_nightly() {
+    require_cmd curl
+    require_cmd tar
+    log "Installing nightly build..."
+
+    local version="nightly-$(date +%Y%m%d)"
+    local version_dir="$VERSIONS_DIR/$version"
+
+    if [ -d "$version_dir" ]; then
+        log "Nightly build for today is already installed"
+        echo "$version" > "$CURRENT_FILE"
+        log "Set $version as active version"
+        return
+    fi
+
+    if [ "$PLATFORM" = "unknown" ]; then
+        error "Unsupported platform: $(uname -s) $(uname -m)"
+    fi
+
+    local filename="nvim-${PLATFORM}.tar.gz"
+    local download_url="https://github.com/neovim/neovim/releases/download/nightly/${filename}"
+
+    local temp_dir
+    temp_dir=$(mktemp -d)
+
+    log "Downloading nightly build from $download_url..."
+    if ! curl -fL -o "$temp_dir/$filename" "$download_url"; then
+        rm -rf "$temp_dir"
+        error "Failed to download nightly build"
+    fi
+
+    log "Extracting..."
+    mkdir -p "$version_dir"
+    if ! tar -xzf "$temp_dir/$filename" -C "$version_dir" --strip-components=1; then
+        rm -rf "$temp_dir" "$version_dir"
+        error "Failed to extract archive"
+    fi
+
+    rm -rf "$temp_dir"
+
+    if [ ! -x "$version_dir/bin/nvim" ]; then
+        rm -rf "$version_dir"
+        error "Installation failed: nvim binary not found in extracted archive"
+    fi
+
+    log "Successfully installed nightly build ($version)"
+
+    echo "$version" > "$CURRENT_FILE"
+    log "Set $version as active version"
+}
+
+install_source() {
+    require_cmd git
+    require_cmd make
+    require_cmd cmake
+    log "Building neovim from source..."
+
+    local temp_dir
+    temp_dir=$(mktemp -d)
+
+    log "Cloning neovim repository..."
+    git clone --depth 1 --branch stable "$NEOVIM_REPO" "$temp_dir/neovim"
+
+    local latest_tag
+    latest_tag=$(git -C "$temp_dir/neovim" describe --tags 2>/dev/null || echo "")
+
+    if [ -z "$latest_tag" ]; then
+        # Fallback: read version from CMakeLists or use the branch name
+        latest_tag="source-$(date +%Y%m%d)"
+        warn "Could not determine version tag, using $latest_tag"
+    fi
+
+    log "Building version: $latest_tag"
+
+    local version_dir="$VERSIONS_DIR/$latest_tag"
+
+    if [ -d "$version_dir" ]; then
+        log "Version $latest_tag is already installed"
+        rm -rf "$temp_dir"
+        return
+    fi
+
+    log "Building neovim (this may take a while)..."
+    make -C "$temp_dir/neovim" CMAKE_BUILD_TYPE=Release
+
+    log "Installing..."
+    mkdir -p "$version_dir"
+    make -C "$temp_dir/neovim" CMAKE_INSTALL_PREFIX="$version_dir" install
+
+    rm -rf "$temp_dir"
+    log "Successfully built and installed neovim $latest_tag"
+
+    if [ ! -f "$CURRENT_FILE" ]; then
+        echo "$latest_tag" > "$CURRENT_FILE"
+        log "Set $latest_tag as default version"
+    fi
+}
+
+uninstall_version() {
+    local version="$1"
+
+    if [ -z "$version" ]; then
+        error "Please specify a version. Usage: neomanager uninstall <version>"
+    fi
+
+    local version_dir="$VERSIONS_DIR/$version"
+
+    if [ ! -d "$version_dir" ]; then
+        error "Version $version is not installed"
+    fi
+
+    local current
+    current=$(cat "$CURRENT_FILE" 2>/dev/null || echo "")
+    if [ "$version" = "$current" ]; then
+        error "Cannot uninstall the currently active version ($version). Switch to another version first."
+    fi
+
+    rm -rf "$version_dir"
+    log "Uninstalled neovim $version"
+}
+
+use_version() {
+    local version="$1"
+
+    if [ -z "$version" ]; then
+        error "Please specify a version. Usage: neomanager use <version>"
+    fi
+
+    local version_dir="$VERSIONS_DIR/$version"
+
+    if [ ! -d "$version_dir" ]; then
+        error "Version $version is not installed. Run 'neomanager install $version' first."
+    fi
+
+    if [ ! -x "$version_dir/bin/nvim" ]; then
+        error "neovim binary not found for version $version. Reinstall with 'neomanager install $version'."
+    fi
+
+    echo "$version" > "$CURRENT_FILE"
+    log "Set $version as default version"
+}
+
+use_local_version() {
+    local version="$1"
+
+    if [ -z "$version" ]; then
+        error "Please specify a version. Usage: neomanager use-local <version>"
+    fi
+
+    local version_dir="$VERSIONS_DIR/$version"
+
+    if [ ! -d "$version_dir" ]; then
+        error "Version $version is not installed. Run 'neomanager install $version' first."
+    fi
+
+    if [ ! -x "$version_dir/bin/nvim" ]; then
+        error "neovim binary not found for version $version. Reinstall with 'neomanager install $version'."
+    fi
+
+    echo "$version" > "$(pwd)/.nvimrc"
+    log "Set $version for current directory (wrote .nvimrc)"
+}
+
+# Walk up the directory tree to find the nearest .nvimrc
+find_local_version() {
+    local dir="$PWD"
+    while [ "$dir" != "/" ]; do
+        if [ -f "$dir/.nvimrc" ]; then
+            cat "$dir/.nvimrc"
+            return 0
+        fi
+        dir=$(dirname "$dir")
+    done
+    return 1
+}
+
+get_current_version() {
+    local version
+
+    # Check for local .nvimrc (walking up the directory tree)
+    version=$(find_local_version 2>/dev/null || echo "")
+    if [ -n "$version" ]; then
+        echo "$version"
+        return 0
+    fi
+
+    # Fall back to the global current file
+    if [ -f "$CURRENT_FILE" ]; then
+        version=$(cat "$CURRENT_FILE")
+        echo "$version"
+        return 0
+    fi
+
+    return 1
+}
+
+show_current() {
+    local version
+    version=$(get_current_version)
+    if [ -z "$version" ]; then
+        log "No version set. Use 'neomanager use <version>' to set a default."
+        return 1
+    fi
+
+    local source="global"
+    if find_local_version &>/dev/null; then
+        source="local (.nvimrc)"
+    fi
+
+    log "Current version: $version ($source)"
+}
+
+which_nvim() {
+    local version
+    version=$(get_current_version)
+
+    if [ -z "$version" ]; then
+        error "No version set. Use 'neomanager use <version>' to set a default."
+    fi
+
+    local nvim_path="$VERSIONS_DIR/$version/bin/nvim"
+
+    if [ -x "$nvim_path" ]; then
+        echo "$nvim_path"
+    else
+        error "neovim binary not found for version $version at $nvim_path"
+    fi
+}
+
+check_updates() {
+    require_cmd curl
+    log "Checking for updates..."
+
+    local current
+    current=$(cat "$CURRENT_FILE" 2>/dev/null || echo "")
+
+    if [ -z "$current" ]; then
+        log "No version currently set"
+        return
+    fi
+
+    log "Current version: $current"
+
+    if [[ "$current" == nightly-* ]]; then
+        log "You're using a nightly build. Install the latest nightly with: neomanager install nightly"
+        return
+    fi
+
+    local latest
+    latest=$(curl -s "${RELEASES_API}?per_page=1" | grep -o '"tag_name": "v[0-9.]*"' | head -n1 | cut -d'"' -f4)
+
+    if [ -z "$latest" ]; then
+        warn "Failed to fetch latest version. Check your internet connection."
+        return
+    fi
+
+    if [ "$current" = "$latest" ]; then
+        log "You're already on the latest version ($latest)"
+    else
+        log "A newer version is available: $latest (current: $current)"
+        log "Update with: neomanager install $latest && neomanager use $latest"
+    fi
+}
+
+exec_nvim() {
+    local version
+    version=$(get_current_version)
+
+    if [ -z "$version" ]; then
+        log "No version set. Installing latest version..."
+        install_latest
+        version=$(get_current_version)
+    fi
+
+    local nvim_path="$VERSIONS_DIR/$version/bin/nvim"
+
+    if [ ! -x "$nvim_path" ]; then
+        error "neovim binary not found for version $version at $nvim_path"
+    fi
+
+    exec "$nvim_path" "$@"
+}
+
+main() {
+    local command="${1:-}"
+    shift || true
+
+    case "$command" in
+        install)
+            install_version "$1"
+            ;;
+        install-latest)
+            install_latest
+            ;;
+        install-source)
+            install_source
+            ;;
+        uninstall)
+            uninstall_version "$1"
+            ;;
+        list|ls)
+            list_installed
+            ;;
+        list-remote|ls-remote)
+            list_remote
+            ;;
+        use)
+            use_version "$1"
+            ;;
+        use-local)
+            use_local_version "$1"
+            ;;
+        current)
+            show_current
+            ;;
+        which)
+            which_nvim
+            ;;
+        update)
+            check_updates
+            ;;
+        version|--version|-v)
+            echo "neomanager v${NEOMANAGER_VERSION}"
+            ;;
+        help|--help|-h)
+            show_help
+            ;;
+        "")
+            show_help
+            ;;
+        *)
+            if [[ "$command" == -* ]]; then
+                exec_nvim "$command" "$@"
+            else
+                error "Unknown command: $command. Use 'neomanager help' for usage."
+            fi
+            ;;
+    esac
+}
+
+main "$@"
