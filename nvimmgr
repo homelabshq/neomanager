@@ -615,6 +615,9 @@ main() {
         update)
             check_updates
             ;;
+        exec)
+            exec_nvim "$@"
+            ;;
         version|--version|-v)
             echo "neomanager v${NEOMANAGER_VERSION}"
             ;;

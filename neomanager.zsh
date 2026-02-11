@@ -23,7 +23,7 @@ add-zsh-hook chpwd _neomanager_chpwd
 # Aliases
 alias neomanager='nvimmgr'
 
-# Wrap nvim to route through neomanager
+# Wrap nvim to launch the managed neovim version
 nvim() {
-    nvimmgr "$@"
+    nvimmgr exec "$@"
 }
