@@ -147,10 +147,12 @@ When you source the shell integration, it:
 
 ## Supported Platforms
 
-| Platform | Architecture |
-|----------|-------------|
-| macOS    | Intel (x86_64), Apple Silicon (arm64) |
-| Linux    | x86_64, ARM64 (aarch64), ARMv7 |
+| Platform | Architecture | Notes |
+|----------|-------------|-------|
+| macOS    | Intel (x86_64) | All versions |
+| macOS    | Apple Silicon (arm64) | v0.10.0+ |
+| Linux    | x86_64 | All versions |
+| Linux    | ARM64 (aarch64) | v0.11.0+ |
 
 ## License
 

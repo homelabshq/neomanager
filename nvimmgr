@@ -8,6 +8,7 @@ VERSIONS_DIR="$NEOMANAGER_DIR/versions"
 CURRENT_FILE="$NEOMANAGER_DIR/current"
 NEOVIM_REPO="https://github.com/neovim/neovim"
 RELEASES_API="https://api.github.com/repos/neovim/neovim/releases"
+LATEST_RELEASE_API="https://api.github.com/repos/neovim/neovim/releases/latest"
 
 detect_platform() {
     local kernel
@@ -19,17 +20,18 @@ detect_platform() {
     case "$kernel" in
         Linux)
             case "$machine" in
-                i686|i386) echo "linux32" ;;
-                x86_64) echo "linux64" ;;
-                aarch64|arm64) echo "linux64-arm64" ;;
-                armv6l|armv7l) echo "linux-armv7l" ;;
+                x86_64)    echo "linux-x86_64" ;;
+                aarch64)   echo "linux-arm64" ;;
+                arm64)     echo "linux-arm64" ;;
+                armv6l)    echo "linux-armv7l" ;;
+                armv7l)    echo "linux-armv7l" ;;
                 *) echo "unknown" ;;
             esac
             ;;
         Darwin)
             case "$machine" in
                 x86_64) echo "macos-x86_64" ;;
-                arm64) echo "macos-arm64" ;;
+                arm64)  echo "macos-arm64" ;;
                 *) echo "unknown" ;;
             esac
             ;;
@@ -40,6 +42,55 @@ detect_platform() {
 }
 
 PLATFORM=$(detect_platform)
+
+# Neovim renamed release assets across versions:
+#   <= v0.10.x: nvim-linux64.tar.gz, nvim-macos.tar.gz
+#   >= v0.11.0: nvim-linux-x86_64.tar.gz, nvim-linux-arm64.tar.gz, nvim-macos-x86_64.tar.gz, etc.
+# This function returns candidate filenames to try (new name first, legacy fallback second).
+get_archive_candidates() {
+    local platform="$1"
+    case "$platform" in
+        linux-x86_64)
+            echo "nvim-linux-x86_64.tar.gz"
+            echo "nvim-linux64.tar.gz"
+            ;;
+        linux-arm64)
+            # Linux arm64 only available from v0.11.0+
+            echo "nvim-linux-arm64.tar.gz"
+            ;;
+        macos-x86_64)
+            echo "nvim-macos-x86_64.tar.gz"
+            echo "nvim-macos.tar.gz"
+            ;;
+        macos-arm64)
+            echo "nvim-macos-arm64.tar.gz"
+            ;;
+        *)
+            echo "nvim-${platform}.tar.gz"
+            ;;
+    esac
+}
+
+# Try downloading from a list of candidate URLs; return on first success.
+download_release() {
+    local version="$1"
+    local dest_dir="$2"
+    local base_url="https://github.com/neovim/neovim/releases/download/${version}"
+    local candidates
+    candidates=$(get_archive_candidates "$PLATFORM")
+    local dest_file=""
+
+    while IFS= read -r filename; do
+        local url="${base_url}/${filename}"
+        log "Trying $url..."
+        if curl -fL -o "$dest_dir/$filename" "$url" 2>/dev/null; then
+            echo "$dest_dir/$filename"
+            return 0
+        fi
+    done <<< "$candidates"
+
+    return 1
+}
 
 init_dirs() {
     mkdir -p "$VERSIONS_DIR"
@@ -169,23 +220,21 @@ install_version() {
         error "Unsupported platform: $(uname -s) $(uname -m)"
     fi
 
-    log "Installing neovim $version..."
-
-    local filename="nvim-${PLATFORM}.tar.gz"
-    local download_url="https://github.com/neovim/neovim/releases/download/${version}/${filename}"
+    log "Installing neovim $version for $PLATFORM..."
 
     local temp_dir
     temp_dir=$(mktemp -d)
 
-    log "Downloading from $download_url..."
-    if ! curl -fL -o "$temp_dir/$filename" "$download_url"; then
+    log "Downloading..."
+    local archive
+    if ! archive=$(download_release "$version" "$temp_dir"); then
         rm -rf "$temp_dir"
-        error "Failed to download neovim $version. Verify the version exists: neomanager list-remote"
+        error "Failed to download neovim $version for $PLATFORM. Verify the version exists: neomanager list-remote"
     fi
 
     log "Extracting..."
     mkdir -p "$version_dir"
-    if ! tar -xzf "$temp_dir/$filename" -C "$version_dir" --strip-components=1; then
+    if ! tar -xzf "$archive" -C "$version_dir" --strip-components=1; then
         rm -rf "$temp_dir" "$version_dir"
         error "Failed to extract archive"
     fi
@@ -210,13 +259,13 @@ install_latest() {
     require_cmd curl
     log "Finding latest stable version..."
     local latest
-    latest=$(curl -s "${RELEASES_API}?per_page=1" | grep -o '"tag_name": "v[0-9.]*"' | head -n1 | cut -d'"' -f4)
+    latest=$(curl -s "$LATEST_RELEASE_API" | grep -o '"tag_name": "[^"]*"' | head -n1 | cut -d'"' -f4)
 
     if [ -z "$latest" ]; then
         error "Failed to fetch latest version. Check your internet connection."
     fi
 
-    log "Latest version is $latest"
+    log "Latest stable version is $latest"
     install_version "$latest"
 }
 
@@ -239,21 +288,19 @@ install_nightly() {
         error "Unsupported platform: $(uname -s) $(uname -m)"
     fi
 
-    local filename="nvim-${PLATFORM}.tar.gz"
-    local download_url="https://github.com/neovim/neovim/releases/download/nightly/${filename}"
-
     local temp_dir
     temp_dir=$(mktemp -d)
 
-    log "Downloading nightly build from $download_url..."
-    if ! curl -fL -o "$temp_dir/$filename" "$download_url"; then
+    log "Downloading nightly build for $PLATFORM..."
+    local archive
+    if ! archive=$(download_release "nightly" "$temp_dir"); then
         rm -rf "$temp_dir"
-        error "Failed to download nightly build"
+        error "Failed to download nightly build for $PLATFORM"
     fi
 
     log "Extracting..."
     mkdir -p "$version_dir"
-    if ! tar -xzf "$temp_dir/$filename" -C "$version_dir" --strip-components=1; then
+    if ! tar -xzf "$archive" -C "$version_dir" --strip-components=1; then
         rm -rf "$temp_dir" "$version_dir"
         error "Failed to extract archive"
     fi
@@ -469,7 +516,7 @@ check_updates() {
     fi
 
     local latest
-    latest=$(curl -s "${RELEASES_API}?per_page=1" | grep -o '"tag_name": "v[0-9.]*"' | head -n1 | cut -d'"' -f4)
+    latest=$(curl -s "$LATEST_RELEASE_API" | grep -o '"tag_name": "[^"]*"' | head -n1 | cut -d'"' -f4)
 
     if [ -z "$latest" ]; then
         warn "Failed to fetch latest version. Check your internet connection."
