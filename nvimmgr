@@ -255,11 +255,38 @@ install_version() {
     fi
 }
 
+# Fetch the latest stable Neovim version tag.
+# Tries the GitHub API first; falls back to parsing the redirect URL from
+# /releases/latest (which doesn't count against the API rate limit).
+fetch_latest_version() {
+    # Method 1: GitHub releases API
+    local latest
+    latest=$(curl -s "$LATEST_RELEASE_API" | grep -o '"tag_name": "[^"]*"' | head -n1 | cut -d'"' -f4)
+    if [ -n "$latest" ]; then
+        echo "$latest"
+        return 0
+    fi
+
+    # Method 2: Follow the /releases/latest redirect and extract the tag from the URL
+    # This doesn't use the API so it's not subject to rate limits
+    local redirect_url
+    redirect_url=$(curl -sI "https://github.com/neovim/neovim/releases/latest" | grep -i '^location:' | tr -d '\r' | awk '{print $2}')
+    if [ -n "$redirect_url" ]; then
+        latest=$(echo "$redirect_url" | grep -o 'v[0-9][0-9.]*$')
+        if [ -n "$latest" ]; then
+            echo "$latest"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
 install_latest() {
     require_cmd curl
     log "Finding latest stable version..."
     local latest
-    latest=$(curl -s "$LATEST_RELEASE_API" | grep -o '"tag_name": "[^"]*"' | head -n1 | cut -d'"' -f4)
+    latest=$(fetch_latest_version)
 
     if [ -z "$latest" ]; then
         error "Failed to fetch latest version. Check your internet connection."
@@ -516,7 +543,7 @@ check_updates() {
     fi
 
     local latest
-    latest=$(curl -s "$LATEST_RELEASE_API" | grep -o '"tag_name": "[^"]*"' | head -n1 | cut -d'"' -f4)
+    latest=$(fetch_latest_version)
 
     if [ -z "$latest" ]; then
         warn "Failed to fetch latest version. Check your internet connection."
