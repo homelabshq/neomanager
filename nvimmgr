@@ -162,7 +162,7 @@ USAGE:
 COMMANDS:
     install <version>      Install a specific neovim version (e.g. v0.10.0, nightly)
     install-latest         Install the latest stable neovim release
-    install-source [tag]    Build and install neovim from source (default: stable)
+    install-source [tag]   Build and install neovim from source (default: stable)
     uninstall <version>    Uninstall a specific version
     list                   List all installed versions
     list-remote            List available versions from GitHub releases
@@ -693,13 +693,20 @@ exec_nvim() {
     version=$(get_current_version)
 
     if [ -z "$version" ]; then
-        error "No version set. Run 'neomanager install-latest' to install and 'neomanager use <version>' to set a default."
+        echo ""
+        echo "  neovim is not installed."
+        echo ""
+        echo "  Run the following to get started:"
+        echo ""
+        echo "    neomanager install-latest"
+        echo ""
+        exit 1
     fi
 
     local nvim_path="$VERSIONS_DIR/$version/bin/nvim"
 
     if [ ! -x "$nvim_path" ]; then
-        error "neovim binary not found for version $version at $nvim_path. Reinstall with 'neomanager install $version'."
+        error "neovim binary not found for version $version. Reinstall with 'neomanager install $version'."
     fi
 
     exec "$nvim_path" "$@"
