@@ -6,6 +6,7 @@ NEOMANAGER_VERSION="0.1.0"
 NEOMANAGER_DIR="${NEOMANAGER_DIR:-$HOME/.neomanager}"
 VERSIONS_DIR="$NEOMANAGER_DIR/versions"
 CURRENT_FILE="$NEOMANAGER_DIR/current"
+LOCK_FILE="$NEOMANAGER_DIR/install.lock"
 NEOVIM_REPO="https://github.com/neovim/neovim"
 RELEASES_API="https://api.github.com/repos/neovim/neovim/releases"
 LATEST_RELEASE_API="https://api.github.com/repos/neovim/neovim/releases/latest"
@@ -84,16 +85,71 @@ download_release() {
         local url="${base_url}/${filename}"
         log "Trying $url..." >&2
         if curl -fL -o "$dest_dir/$filename" "$url" 2>/dev/null; then
-            echo "$dest_dir/$filename"
-            return 0
+            if verify_checksum "$base_url" "$dest_dir" "$filename"; then
+                echo "$dest_dir/$filename"
+                return 0
+            else
+                rm -f "$dest_dir/$filename"
+                warn "Checksum verification failed for $filename, skipping..."
+            fi
         fi
     done <<< "$candidates"
 
     return 1
 }
 
+verify_checksum() {
+    local base_url="$1"
+    local dest_dir="$2"
+    local filename="$3"
+    local sha256_file="${filename}.sha256sum"
+
+    local sha256sum_url="${base_url}/${sha256_file}"
+    local expected_checksum
+    expected_checksum=$(curl -fsSL "$sha256sum_url" 2>/dev/null | awk '{print $1}')
+
+    if [ -z "$expected_checksum" ]; then
+        warn "No checksum available for $filename, skipping verification"
+        return 0
+    fi
+
+    local actual_checksum
+    actual_checksum=$(shasum -a 256 "$dest_dir/$filename" 2>/dev/null | awk '{print $1}')
+
+    if [ "$actual_checksum" = "$expected_checksum" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
 init_dirs() {
     mkdir -p "$VERSIONS_DIR"
+}
+
+lock_acquire() {
+    init_dirs
+    local max_wait=30
+    local waited=0
+    while [ "$waited" -lt "$max_wait" ]; do
+        if (set -C; echo $$ > "$LOCK_FILE") 2>/dev/null; then
+            trap 'lock_release' EXIT
+            return 0
+        fi
+        local lock_pid
+        lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+            rm -f "$LOCK_FILE"
+            continue
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    error "Could not acquire install lock after ${max_wait}s. Another install may be running."
+}
+
+lock_release() {
+    rm -f "$LOCK_FILE"
 }
 
 show_help() {
@@ -106,12 +162,12 @@ USAGE:
 COMMANDS:
     install <version>      Install a specific neovim version (e.g. v0.10.0, nightly)
     install-latest         Install the latest stable neovim release
-    install-source         Build and install neovim from source
+    install-source [tag]    Build and install neovim from source (default: stable)
     uninstall <version>    Uninstall a specific version
     list                   List all installed versions
     list-remote            List available versions from GitHub releases
     use <version>          Set default neovim version globally
-    use-local <version>    Set neovim version for current directory (.nvimrc)
+    use-local <version>    Set neovim version for current directory (.nvim-version)
     current                Show currently active version
     which                  Show path to active neovim binary
     update                 Check for available updates
@@ -144,6 +200,17 @@ warn() {
     echo "neomanager warning: $1" >&2
 }
 
+validate_version() {
+    local version="$1"
+    if ! echo "$version" | grep -qE '^(v[0-9]+\.[0-9]+\.[0-9]+|nightly|nightly-[0-9]{8}|source-[0-9]{8}|stable)$'; then
+        return 1
+    fi
+    if echo "$version" | grep -q '\.\.'; then
+        return 1
+    fi
+    return 0
+}
+
 # Verify that required commands are available
 require_cmd() {
     if ! command -v "$1" &> /dev/null; then
@@ -151,22 +218,50 @@ require_cmd() {
     fi
 }
 
+atomic_write() {
+    local dest="$1"
+    local content="$2"
+    local tmp="${dest}.tmp.$$"
+    printf '%s\n' "$content" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$dest"
+}
+
 list_installed() {
     init_dirs
-    local versions
-    versions=$(ls -1 "$VERSIONS_DIR" 2>/dev/null)
-    if [ -z "$versions" ]; then
+    local current
+    current=$(cat "$CURRENT_FILE" 2>/dev/null || echo "")
+    local found=0
+    for version_dir in "$VERSIONS_DIR"/*/; do
+        [ -d "$version_dir" ] || continue
+        found=1
+        local v
+        v=$(basename "$version_dir")
+        if [ "$v" = "$current" ]; then
+            echo "* $v (active)"
+        else
+            echo "  $v"
+        fi
+    done | sort -V
+    if [ "$found" -eq 0 ]; then
         log "No versions installed"
+    fi
+}
+
+parse_tags() {
+    local json="$1"
+    if command -v jq &>/dev/null; then
+        echo "$json" | jq -r '.[].tag_name' 2>/dev/null | grep -E '^v[0-9]+\.[0-9]+' || true
     else
-        local current
-        current=$(cat "$CURRENT_FILE" 2>/dev/null || echo "")
-        echo "$versions" | sort -V | while read -r v; do
-            if [ "$v" = "$current" ]; then
-                echo "* $v (active)"
-            else
-                echo "  $v"
-            fi
-        done
+        echo "$json" | grep -o '"tag_name": "v[0-9.]*"' | cut -d'"' -f4
+    fi
+}
+
+parse_latest_tag() {
+    local json="$1"
+    if command -v jq &>/dev/null; then
+        echo "$json" | jq -r '.tag_name' 2>/dev/null
+    else
+        echo "$json" | grep -o '"tag_name": "[^"]*"' | head -n1 | cut -d'"' -f4
     fi
 }
 
@@ -179,13 +274,12 @@ list_remote() {
         local page_data
         page_data=$(curl -s "${RELEASES_API}?per_page=100&page=${page}")
         local tags
-        tags=$(echo "$page_data" | grep -o '"tag_name": "v[0-9.]*"' | cut -d'"' -f4)
+        tags=$(parse_tags "$page_data")
         if [ -z "$tags" ]; then
             break
         fi
         results="${results}${tags}"$'\n'
         page=$((page + 1))
-        # Safety limit to avoid infinite loops
         if [ "$page" -gt 10 ]; then
             break
         fi
@@ -200,9 +294,14 @@ install_version() {
         error "Please specify a version. Usage: neomanager install <version>"
     fi
 
+    if ! validate_version "$version"; then
+        error "Invalid version format: $version. Expected format like v0.10.0, nightly, or stable."
+    fi
+
     require_cmd curl
     require_cmd tar
     init_dirs
+    lock_acquire
 
     if [ "$version" = "nightly" ]; then
         install_nightly
@@ -224,11 +323,13 @@ install_version() {
 
     local temp_dir
     temp_dir=$(mktemp -d)
+    trap "rm -rf '$temp_dir'" EXIT
 
     log "Downloading..."
     local archive
     if ! archive=$(download_release "$version" "$temp_dir"); then
         rm -rf "$temp_dir"
+        trap - EXIT
         error "Failed to download neovim $version for $PLATFORM. Verify the version exists: neomanager list-remote"
     fi
 
@@ -236,10 +337,12 @@ install_version() {
     mkdir -p "$version_dir"
     if ! tar -xzf "$archive" -C "$version_dir" --strip-components=1; then
         rm -rf "$temp_dir" "$version_dir"
+        trap - EXIT
         error "Failed to extract archive"
     fi
 
     rm -rf "$temp_dir"
+    trap - EXIT
 
     # Verify the binary exists
     if [ ! -x "$version_dir/bin/nvim" ]; then
@@ -250,7 +353,7 @@ install_version() {
     log "Successfully installed neovim $version"
 
     if [ ! -f "$CURRENT_FILE" ]; then
-        echo "$version" > "$CURRENT_FILE"
+        atomic_write "$CURRENT_FILE" "$version"
         log "Set $version as default version"
     fi
 }
@@ -259,16 +362,15 @@ install_version() {
 # Tries the GitHub API first; falls back to parsing the redirect URL from
 # /releases/latest (which doesn't count against the API rate limit).
 fetch_latest_version() {
-    # Method 1: GitHub releases API
+    local api_response
+    api_response=$(curl -s "$LATEST_RELEASE_API")
     local latest
-    latest=$(curl -s "$LATEST_RELEASE_API" | grep -o '"tag_name": "[^"]*"' | head -n1 | cut -d'"' -f4)
+    latest=$(parse_latest_tag "$api_response")
     if [ -n "$latest" ]; then
         echo "$latest"
         return 0
     fi
 
-    # Method 2: Follow the /releases/latest redirect and extract the tag from the URL
-    # This doesn't use the API so it's not subject to rate limits
     local redirect_url
     redirect_url=$(curl -sI "https://github.com/neovim/neovim/releases/latest" | grep -i '^location:' | tr -d '\r' | awk '{print $2}')
     if [ -n "$redirect_url" ]; then
@@ -299,6 +401,8 @@ install_latest() {
 install_nightly() {
     require_cmd curl
     require_cmd tar
+    init_dirs
+    lock_acquire
     log "Installing nightly build..."
 
     local version="nightly-$(date +%Y%m%d)"
@@ -306,7 +410,7 @@ install_nightly() {
 
     if [ -d "$version_dir" ]; then
         log "Nightly build for today is already installed"
-        echo "$version" > "$CURRENT_FILE"
+        atomic_write "$CURRENT_FILE" "$version"
         log "Set $version as active version"
         return
     fi
@@ -317,11 +421,13 @@ install_nightly() {
 
     local temp_dir
     temp_dir=$(mktemp -d)
+    trap "rm -rf '$temp_dir'" EXIT
 
     log "Downloading nightly build for $PLATFORM..."
     local archive
     if ! archive=$(download_release "nightly" "$temp_dir"); then
         rm -rf "$temp_dir"
+        trap - EXIT
         error "Failed to download nightly build for $PLATFORM"
     fi
 
@@ -329,10 +435,12 @@ install_nightly() {
     mkdir -p "$version_dir"
     if ! tar -xzf "$archive" -C "$version_dir" --strip-components=1; then
         rm -rf "$temp_dir" "$version_dir"
+        trap - EXIT
         error "Failed to extract archive"
     fi
 
     rm -rf "$temp_dir"
+    trap - EXIT
 
     if [ ! -x "$version_dir/bin/nvim" ]; then
         rm -rf "$version_dir"
@@ -341,27 +449,31 @@ install_nightly() {
 
     log "Successfully installed nightly build ($version)"
 
-    echo "$version" > "$CURRENT_FILE"
+    atomic_write "$CURRENT_FILE" "$version"
     log "Set $version as active version"
 }
 
 install_source() {
+    local tag="${1:-stable}"
+
     require_cmd git
     require_cmd make
     require_cmd cmake
+    init_dirs
+    lock_acquire
     log "Building neovim from source..."
 
     local temp_dir
     temp_dir=$(mktemp -d)
+    trap "rm -rf '$temp_dir'" EXIT
 
-    log "Cloning neovim repository..."
-    git clone --depth 1 --branch stable "$NEOVIM_REPO" "$temp_dir/neovim"
+    log "Cloning neovim repository (branch/tag: $tag)..."
+    git clone --depth 1 --branch "$tag" "$NEOVIM_REPO" "$temp_dir/neovim"
 
     local latest_tag
     latest_tag=$(git -C "$temp_dir/neovim" describe --tags 2>/dev/null || echo "")
 
     if [ -z "$latest_tag" ]; then
-        # Fallback: read version from CMakeLists or use the branch name
         latest_tag="source-$(date +%Y%m%d)"
         warn "Could not determine version tag, using $latest_tag"
     fi
@@ -373,6 +485,7 @@ install_source() {
     if [ -d "$version_dir" ]; then
         log "Version $latest_tag is already installed"
         rm -rf "$temp_dir"
+        trap - EXIT
         return
     fi
 
@@ -384,10 +497,11 @@ install_source() {
     make -C "$temp_dir/neovim" CMAKE_INSTALL_PREFIX="$version_dir" install
 
     rm -rf "$temp_dir"
+    trap - EXIT
     log "Successfully built and installed neovim $latest_tag"
 
     if [ ! -f "$CURRENT_FILE" ]; then
-        echo "$latest_tag" > "$CURRENT_FILE"
+        atomic_write "$CURRENT_FILE" "$latest_tag"
         log "Set $latest_tag as default version"
     fi
 }
@@ -397,6 +511,10 @@ uninstall_version() {
 
     if [ -z "$version" ]; then
         error "Please specify a version. Usage: neomanager uninstall <version>"
+    fi
+
+    if ! validate_version "$version"; then
+        error "Invalid version format: $version"
     fi
 
     local version_dir="$VERSIONS_DIR/$version"
@@ -422,6 +540,10 @@ use_version() {
         error "Please specify a version. Usage: neomanager use <version>"
     fi
 
+    if ! validate_version "$version"; then
+        error "Invalid version format: $version"
+    fi
+
     local version_dir="$VERSIONS_DIR/$version"
 
     if [ ! -d "$version_dir" ]; then
@@ -432,7 +554,7 @@ use_version() {
         error "neovim binary not found for version $version. Reinstall with 'neomanager install $version'."
     fi
 
-    echo "$version" > "$CURRENT_FILE"
+    atomic_write "$CURRENT_FILE" "$version"
     log "Set $version as default version"
 }
 
@@ -443,6 +565,10 @@ use_local_version() {
         error "Please specify a version. Usage: neomanager use-local <version>"
     fi
 
+    if ! validate_version "$version"; then
+        error "Invalid version format: $version"
+    fi
+
     local version_dir="$VERSIONS_DIR/$version"
 
     if [ ! -d "$version_dir" ]; then
@@ -453,17 +579,21 @@ use_local_version() {
         error "neovim binary not found for version $version. Reinstall with 'neomanager install $version'."
     fi
 
-    echo "$version" > "$(pwd)/.nvimrc"
-    log "Set $version for current directory (wrote .nvimrc)"
+    echo "$version" > "$(pwd)/.nvim-version"
+    log "Set $version for current directory (wrote .nvim-version)"
 }
 
-# Walk up the directory tree to find the nearest .nvimrc
+# Walk up the directory tree to find the nearest .nvim-version
 find_local_version() {
     local dir="$PWD"
     while [ "$dir" != "/" ]; do
-        if [ -f "$dir/.nvimrc" ]; then
-            cat "$dir/.nvimrc"
-            return 0
+        if [ -f "$dir/.nvim-version" ]; then
+            local version
+            version=$(cat "$dir/.nvim-version" 2>/dev/null)
+            if [ -n "$version" ] && validate_version "$version"; then
+                echo "$version"
+                return 0
+            fi
         fi
         dir=$(dirname "$dir")
     done
@@ -473,7 +603,7 @@ find_local_version() {
 get_current_version() {
     local version
 
-    # Check for local .nvimrc (walking up the directory tree)
+    # Check for local .nvim-version (walking up the directory tree)
     version=$(find_local_version 2>/dev/null || echo "")
     if [ -n "$version" ]; then
         echo "$version"
@@ -500,7 +630,7 @@ show_current() {
 
     local source="global"
     if find_local_version &>/dev/null; then
-        source="local (.nvimrc)"
+        source="local (.nvim-version)"
     fi
 
     log "Current version: $version ($source)"
@@ -563,15 +693,13 @@ exec_nvim() {
     version=$(get_current_version)
 
     if [ -z "$version" ]; then
-        log "No version set. Installing latest version..."
-        install_latest
-        version=$(get_current_version)
+        error "No version set. Run 'neomanager install-latest' to install and 'neomanager use <version>' to set a default."
     fi
 
     local nvim_path="$VERSIONS_DIR/$version/bin/nvim"
 
     if [ ! -x "$nvim_path" ]; then
-        error "neovim binary not found for version $version at $nvim_path"
+        error "neovim binary not found for version $version at $nvim_path. Reinstall with 'neomanager install $version'."
     fi
 
     exec "$nvim_path" "$@"
@@ -589,7 +717,7 @@ main() {
             install_latest
             ;;
         install-source)
-            install_source
+            install_source "$1"
             ;;
         uninstall)
             uninstall_version "$1"

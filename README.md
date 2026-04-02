@@ -7,7 +7,7 @@ A lightweight version manager for [Neovim](https://neovim.io), written in Bash. 
 - Install pre-built Neovim releases from GitHub
 - Install nightly builds
 - Build from source
-- Switch between versions globally or per-project (`.nvimrc`)
+- Switch between versions globally or per-project (`.nvim-version`)
 - Automatic version switching when entering project directories
 - Supports macOS (Intel & Apple Silicon) and Linux (x86_64, ARM64, ARMv7)
 
@@ -97,7 +97,7 @@ neomanager use v0.10.0
 neomanager use-local v0.9.5
 ```
 
-This creates a `.nvimrc` file in the current directory. When you `cd` into this directory, neomanager automatically switches to the specified version.
+This creates a `.nvim-version` file in the current directory. When you `cd` into this directory, neomanager automatically switches to the specified version.
 
 ### Show current version
 
@@ -134,11 +134,11 @@ nvim file.txt
 
 ## How It Works
 
-neomanager downloads pre-built Neovim binaries from GitHub releases (or builds from source). Versions are stored in `~/.neomanager/versions/`. The active version is tracked in `~/.neomanager/current` or per-directory via `.nvimrc` files.
+neomanager downloads pre-built Neovim binaries from GitHub releases (or builds from source). Versions are stored in `~/.neomanager/versions/`. The active version is tracked in `~/.neomanager/current` or per-directory via `.nvim-version` files.
 
 When you source the shell integration, it:
 - Adds the `neomanager` and `nvim` commands
-- Hooks into `cd` to automatically detect `.nvimrc` files
+- Hooks into `cd` to automatically detect `.nvim-version` files
 
 ## Requirements
 
