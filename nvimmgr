@@ -583,13 +583,19 @@ use_local_version() {
     log "Set $version for current directory (wrote .nvim-version)"
 }
 
-# Walk up the directory tree to find the nearest .nvim-version
+# Walk up the directory tree to find the nearest .nvim-version (or legacy .nvimrc)
 find_local_version() {
     local dir="$PWD"
     while [ "$dir" != "/" ]; do
+        local version_file=""
         if [ -f "$dir/.nvim-version" ]; then
+            version_file="$dir/.nvim-version"
+        elif [ -f "$dir/.nvimrc" ]; then
+            version_file="$dir/.nvimrc"
+        fi
+        if [ -n "$version_file" ]; then
             local version
-            version=$(cat "$dir/.nvim-version" 2>/dev/null)
+            version=$(cat "$version_file" 2>/dev/null)
             if [ -n "$version" ] && validate_version "$version"; then
                 echo "$version"
                 return 0

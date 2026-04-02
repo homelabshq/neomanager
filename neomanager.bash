@@ -10,8 +10,14 @@ _neomanager_version_check() {
     local version=""
     local dir="$PWD"
     while [ "$dir" != "/" ]; do
+        local version_file=""
         if [ -f "$dir/.nvim-version" ]; then
-            version=$(cat "$dir/.nvim-version" 2>/dev/null)
+            version_file="$dir/.nvim-version"
+        elif [ -f "$dir/.nvimrc" ]; then
+            version_file="$dir/.nvimrc"
+        fi
+        if [ -n "$version_file" ]; then
+            version=$(cat "$version_file" 2>/dev/null)
             if [ -n "$version" ] && echo "$version" | grep -qE '^(v[0-9]+\.[0-9]+\.[0-9]+|nightly|nightly-[0-9]{8}|source-[0-9]{8}|stable)$'; then
                 break
             fi
